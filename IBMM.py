@@ -48,6 +48,62 @@ def build_and_solve(plants, markets, plant_capacity, demand, prod_cost, transpor
 
     return solution, mdl, None
 
+def solve_with_ortools(plants, markets, plant_capacity, demand, prod_cost, transport_cost, route_capacity, service_level: float):
+    """
+    Fallback LP solver using OR-Tools (GLOP) so the app can run on
+    Streamlit Cloud where CPLEX runtime is unavailable.
+    Returns (result_dict, err) where result_dict contains:
+    - 'flows_df': DataFrame of shipments
+    - 'objective': objective value
+    - 'shipped_by_market': dict market -> shipped quantity
+    """
+    try:
+        from ortools.linear_solver import pywraplp
+    except Exception as e:
+        return None, f"ORTools not available: {e}"
+
+    solver = pywraplp.Solver.CreateSolver('GLOP')
+    if solver is None:
+        return None, "Failed to create OR-Tools GLOP solver."
+
+    # decision variables with upper bounds equal to route capacity
+    x = {}
+    for p in plants:
+        for m in markets:
+            ub = float(route_capacity[(p, m)])
+            x[(p, m)] = solver.NumVar(0.0, ub, f"x_{p}_{m}")
+
+    # objective: minimize total cost
+    objective_expr = solver.Sum(
+        (float(prod_cost[p]) + float(transport_cost[(p, m)])) * x[(p, m)]
+        for p in plants for m in markets
+    )
+    solver.Minimize(objective_expr)
+
+    # constraints
+    for p in plants:
+        solver.Add(solver.Sum(x[(p, m)] for m in markets) <= float(plant_capacity[p]))
+    for m in markets:
+        solver.Add(solver.Sum(x[(p, m)] for p in plants) >= float(service_level * demand[m]))
+
+    status = solver.Solve()
+    if status not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
+        return None, "No feasible solution with OR-Tools."
+
+    rows = []
+    shipped_by_market = {m: 0.0 for m in markets}
+    for (p, m), var in x.items():
+        qty = var.solution_value()
+        if qty and qty > 1e-8:
+            unit_cost = float(prod_cost[p]) + float(transport_cost[(p, m)])
+            rows.append({"Plant": p, "Market": m, "Quantity": round(qty, 2), "UnitCost": round(unit_cost, 2)})
+            shipped_by_market[m] += float(qty)
+
+    flows_df = pd.DataFrame(rows)
+    objective_value = solver.Objective().Value()
+
+    return {"flows_df": flows_df, "shipped_by_market": shipped_by_market, "objective": objective_value}, None
+
 
 st.set_page_config(page_title="Simple Supply Chain Optimizer", page_icon="📦", layout="wide")
 st.title("Simple Supply Chain Optimizer")
@@ -331,62 +387,59 @@ if run_solve:
 
         # === 統一後處理 ===
         if err:
-            st.session_state['results'] = {'error': err, 'flows': None, 'objective': None}
-            # 針對常見的 CPLEX Runtime 問題給出指引
+            # If CPLEX runtime is missing, try OR-Tools fallback
             if "no cplex runtime" in str(err).lower():
-                st.warning("No CPLEX runtime found on Streamlit Cloud. Try running locally with CPLEX or export LP to solve offline.")
-                st.code(f"{sys.executable} -m pip install cplex", language="bash")
-                if mdl is not None:
-                    with st.expander("Export model as LP (for offline solving)"):
-                        try:
-                            st.code(mdl.export_as_lp_string()[:5000] + "\n... (truncated)", language="lp")
-                        except Exception:
-                            st.info("LP export not available.")
-        elif (solution is None) or (mdl is None):
-            # 嘗試在雲端再跑一次並開啟 log（有時可得到更清楚的訊息）
-            retry_msg = None
-            try:
-                solution = mdl.solve(log_output=True) if mdl is not None else None
-            except Exception as e2:
-                retry_msg = str(e2)
+                with st.spinner("CPLEX missing; trying OR-Tools fallback..."):
+                    alt_res, alt_err = solve_with_ortools(
+                        plants, markets, plant_capacity, demand,
+                        prod_cost, transport_cost, route_capacity, service_level
+                    )
+                if alt_err is None and alt_res:
+                    flows_df = alt_res['flows_df']
+                    shipped_by_market = alt_res['shipped_by_market']
+                    total_shipped = float(flows_df['Quantity'].sum()) if not flows_df.empty else 0.0
+                    total_demand = float(sum(demand.values()))
+                    ratios = []
+                    for m in markets:
+                        dem = demand.get(m, 0.0)
+                        ship = shipped_by_market.get(m, 0.0)
+                        ratios.append(ship / dem if dem > 0 else 1.0)
+                    min_service = min(ratios) if ratios else 0.0
 
-            if (solution is None):
-                # 快速可行性診斷：總產能 vs. 服務水準 × 總需求
-                total_capacity = float(sum(plant_capacity.values()))
-                required = float(service_level * sum(demand.values()))
-                tips = []
-                if total_capacity + 1e-9 < required:
-                    tips.append(f"Total capacity ({total_capacity:.1f}) < required service ({required:.1f}).")
-                # 構造錯誤訊息
-                msg = "No feasible solution found."
-                if retry_msg:
-                    msg += f" Retry error: {retry_msg}"
-                st.session_state['results'] = {'error': msg, 'flows': None, 'objective': None}
-                if tips:
-                    st.info("Feasibility tips:\n- " + "\n- ".join(tips))
-                if mdl is not None:
-                    with st.expander("Export model as LP (for offline solving)"):
-                        try:
-                            st.code(mdl.export_as_lp_string()[:5000] + "\n... (truncated)", language="lp")
-                        except Exception:
-                            st.info("LP export not available.")
+                    st.session_state['results'] = {
+                        'error': None,
+                        'flows': flows_df,
+                        'objective': alt_res['objective'],
+                        'total_shipped': total_shipped,
+                        'total_demand': total_demand,
+                        'min_service': min_service,
+                        'target_service': service_level,
+                        'solver': 'OR-Tools (GLOP)'
+                    }
+                    st.info("Solved with OR-Tools (GLOP) because CPLEX runtime isn't available.")
+                else:
+                    st.session_state['results'] = {'error': err, 'flows': None, 'objective': None}
+                    st.warning("No CPLEX runtime found on Streamlit Cloud. Try running locally with CPLEX or export LP to solve offline.")
+                    st.code(f"{sys.executable} -m pip install cplex", language="bash")
+                    st.code(f"{sys.executable} -m pip install ortools", language="bash")
+                    if mdl is not None:
+                        with st.expander("Export model as LP (for offline solving)"):
+                            try:
+                                st.code(mdl.export_as_lp_string()[:5000] + "\n... (truncated)", language="lp")
+                            except Exception:
+                                st.info("LP export not available.")
             else:
-                # 進入成功路徑（與下面相同）
-                rows = []
-                shipped_by_market = {m: 0.0 for m in markets}
-                for v in mdl.iter_variables():
-                    qty = v.solution_value
-                    if qty and qty > 0:
-                        # 安全分割：只切兩次，避免名稱含底線導致錯位
-                        parts = v.name.split("_", 2)  # e.g. ["x", "PlantName", "Market_Name_With_Underscore"]
-                        p = parts[1] if len(parts) >= 2 else "?"
-                        m = parts[2] if len(parts) >= 3 else v.name
-                        unit_cost = prod_cost.get(p, 0.0) + transport_cost.get((p, m), 0.0)
-                        rows.append({"Plant": p, "Market": m, "Quantity": round(qty, 2), "UnitCost": round(unit_cost, 2)})
-                        if m in shipped_by_market:
-                            shipped_by_market[m] += float(qty)
-
-                flows_df = pd.DataFrame(rows)
+                st.session_state['results'] = {'error': err, 'flows': None, 'objective': None}
+        elif (solution is None) or (mdl is None):
+            # First, try OR-Tools fallback
+            with st.spinner("Trying OR-Tools fallback..."):
+                alt_res, alt_err = solve_with_ortools(
+                    plants, markets, plant_capacity, demand,
+                    prod_cost, transport_cost, route_capacity, service_level
+                )
+            if alt_err is None and alt_res:
+                flows_df = alt_res['flows_df']
+                shipped_by_market = alt_res['shipped_by_market']
                 total_shipped = float(flows_df['Quantity'].sum()) if not flows_df.empty else 0.0
                 total_demand = float(sum(demand.values()))
                 ratios = []
@@ -395,16 +448,79 @@ if run_solve:
                     ship = shipped_by_market.get(m, 0.0)
                     ratios.append(ship / dem if dem > 0 else 1.0)
                 min_service = min(ratios) if ratios else 0.0
-
                 st.session_state['results'] = {
                     'error': None,
                     'flows': flows_df,
-                    'objective': mdl.objective_value,
+                    'objective': alt_res['objective'],
                     'total_shipped': total_shipped,
                     'total_demand': total_demand,
                     'min_service': min_service,
                     'target_service': service_level,
+                    'solver': 'OR-Tools (GLOP)'
                 }
+            else:
+                # 嘗試在雲端再跑一次並開啟 log（有時可得到更清楚的訊息）
+                retry_msg = None
+                try:
+                    solution = mdl.solve(log_output=True) if mdl is not None else None
+                except Exception as e2:
+                    retry_msg = str(e2)
+
+                if (solution is None):
+                    # 快速可行性診斷：總產能 vs. 服務水準 × 總需求
+                    total_capacity = float(sum(plant_capacity.values()))
+                    required = float(service_level * sum(demand.values()))
+                    tips = []
+                    if total_capacity + 1e-9 < required:
+                        tips.append(f"Total capacity ({total_capacity:.1f}) < required service ({required:.1f}).")
+                    # 構造錯誤訊息
+                    msg = "No feasible solution found."
+                    if retry_msg:
+                        msg += f" Retry error: {retry_msg}"
+                    st.session_state['results'] = {'error': msg, 'flows': None, 'objective': None}
+                    if tips:
+                        st.info("Feasibility tips:\n- " + "\n- ".join(tips))
+                    if mdl is not None:
+                        with st.expander("Export model as LP (for offline solving)"):
+                            try:
+                                st.code(mdl.export_as_lp_string()[:5000] + "\n... (truncated)", language="lp")
+                            except Exception:
+                                st.info("LP export not available.")
+                else:
+                    # 進入成功路徑（與下面相同）
+                    rows = []
+                    shipped_by_market = {m: 0.0 for m in markets}
+                    for v in mdl.iter_variables():
+                        qty = v.solution_value
+                        if qty and qty > 0:
+                            # 安全分割：只切兩次，避免名稱含底線導致錯位
+                            parts = v.name.split("_", 2)  # e.g. ["x", "PlantName", "Market_Name_With_Underscore"]
+                            p = parts[1] if len(parts) >= 2 else "?"
+                            m = parts[2] if len(parts) >= 3 else v.name
+                            unit_cost = prod_cost.get(p, 0.0) + transport_cost.get((p, m), 0.0)
+                            rows.append({"Plant": p, "Market": m, "Quantity": round(qty, 2), "UnitCost": round(unit_cost, 2)})
+                            if m in shipped_by_market:
+                                shipped_by_market[m] += float(qty)
+
+                    flows_df = pd.DataFrame(rows)
+                    total_shipped = float(flows_df['Quantity'].sum()) if not flows_df.empty else 0.0
+                    total_demand = float(sum(demand.values()))
+                    ratios = []
+                    for m in markets:
+                        dem = demand.get(m, 0.0)
+                        ship = shipped_by_market.get(m, 0.0)
+                        ratios.append(ship / dem if dem > 0 else 1.0)
+                    min_service = min(ratios) if ratios else 0.0
+
+                    st.session_state['results'] = {
+                        'error': None,
+                        'flows': flows_df,
+                        'objective': mdl.objective_value,
+                        'total_shipped': total_shipped,
+                        'total_demand': total_demand,
+                        'min_service': min_service,
+                        'target_service': service_level,
+                    }
         else:
             # 直接成功的情況
             rows = []
@@ -463,6 +579,8 @@ else:
         c1.metric(label="Total Cost", value=f"${res['objective']:,.2f}")
         c2.metric(label="Total Shipped", value=f"{res['total_shipped']:,.1f}")
         c3.metric(label="Total Demand", value=f"{res['total_demand']:,.1f}")
+        if res.get('solver'):
+            st.caption(f"Solved with {res['solver']}")
         c4, c5 = st.columns(2)
         c4.metric(label="Min Market Service", value=f"{res['min_service']*100:.1f}%")
         c5.metric(label="Target Service", value=f"{res['target_service']*100:.1f}%")
