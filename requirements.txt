@@ -2,4 +2,4 @@ streamlit
 pandas
 docplex
 # Optional: IBM CPLEX runtime (needed to solve with CPLEX)
-# cplex
+cplex
