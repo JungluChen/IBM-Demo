@@ -171,17 +171,17 @@ def validate_inputs_dicts(plants, markets, plant_capacity, prod_cost, demand, tr
         messages.append("Markets list contains empty names.")
     if len(set(markets)) != len(markets):
         messages.append("Duplicate Market names are not allowed.")
-    # plant parameters
+    # plant parameters 
     for p in plants:
         if float(plant_capacity.get(p, 0)) < 0:
             messages.append(f"Capacity for plant {p} must be non-negative.")
         if float(prod_cost.get(p, 0)) < 0:
             messages.append(f"ProdCost for plant {p} must be non-negative.")
-    # market demand
+    # market demand 
     for m in markets:
         if float(demand.get(m, 0)) < 0:
             messages.append(f"Demand for market {m} must be non-negative.")
-    # route parameters
+    # route parameters 
     for p in plants:
         for m in markets:
             if float(transport_cost.get(p, {}).get(m, 0)) < 0:
@@ -313,6 +313,7 @@ if run_solve:
             st.session_state['transport_cost'],
             st.session_state['route_capacity']
         )
+        
         for w in warnings:
             st.warning(w)
         plant_capacity = {p: float(st.session_state['plant_capacity'].get(p, 0.0)) for p in plants}
@@ -322,24 +323,104 @@ if run_solve:
         route_capacity = {(p, m): float(st.session_state['route_capacity'].get(p, {}).get(m, 0.0)) for p in plants for m in markets}
 
         with st.spinner("Solving the optimization model..."):
-            solution, mdl, err = build_and_solve(plants, markets, plant_capacity, demand, prod_cost, transport_cost, route_capacity, service_level)
+            # 一次求解（build_and_solve 內部可改為 mdl.solve(log_output=True)；這裡先呼叫既有函式）
+            solution, mdl, err = build_and_solve(
+                plants, markets, plant_capacity, demand,
+                prod_cost, transport_cost, route_capacity, service_level
+            )
+
+        # === 統一後處理 ===
         if err:
             st.session_state['results'] = {'error': err, 'flows': None, 'objective': None}
-        elif solution is None:
-            st.session_state['results'] = {'error': 'No feasible solution found.', 'flows': None, 'objective': None}
+            # 針對常見的 CPLEX Runtime 問題給出指引
+            if "no cplex runtime" in str(err).lower():
+                st.warning("No CPLEX runtime found on Streamlit Cloud. Try running locally with CPLEX or export LP to solve offline.")
+                st.code(f"{sys.executable} -m pip install cplex", language="bash")
+                if mdl is not None:
+                    with st.expander("Export model as LP (for offline solving)"):
+                        try:
+                            st.code(mdl.export_as_lp_string()[:5000] + "\n... (truncated)", language="lp")
+                        except Exception:
+                            st.info("LP export not available.")
+        elif (solution is None) or (mdl is None):
+            # 嘗試在雲端再跑一次並開啟 log（有時可得到更清楚的訊息）
+            retry_msg = None
+            try:
+                solution = mdl.solve(log_output=True) if mdl is not None else None
+            except Exception as e2:
+                retry_msg = str(e2)
+
+            if (solution is None):
+                # 快速可行性診斷：總產能 vs. 服務水準 × 總需求
+                total_capacity = float(sum(plant_capacity.values()))
+                required = float(service_level * sum(demand.values()))
+                tips = []
+                if total_capacity + 1e-9 < required:
+                    tips.append(f"Total capacity ({total_capacity:.1f}) < required service ({required:.1f}).")
+                # 構造錯誤訊息
+                msg = "No feasible solution found."
+                if retry_msg:
+                    msg += f" Retry error: {retry_msg}"
+                st.session_state['results'] = {'error': msg, 'flows': None, 'objective': None}
+                if tips:
+                    st.info("Feasibility tips:\n- " + "\n- ".join(tips))
+                if mdl is not None:
+                    with st.expander("Export model as LP (for offline solving)"):
+                        try:
+                            st.code(mdl.export_as_lp_string()[:5000] + "\n... (truncated)", language="lp")
+                        except Exception:
+                            st.info("LP export not available.")
+            else:
+                # 進入成功路徑（與下面相同）
+                rows = []
+                shipped_by_market = {m: 0.0 for m in markets}
+                for v in mdl.iter_variables():
+                    qty = v.solution_value
+                    if qty and qty > 0:
+                        # 安全分割：只切兩次，避免名稱含底線導致錯位
+                        parts = v.name.split("_", 2)  # e.g. ["x", "PlantName", "Market_Name_With_Underscore"]
+                        p = parts[1] if len(parts) >= 2 else "?"
+                        m = parts[2] if len(parts) >= 3 else v.name
+                        unit_cost = prod_cost.get(p, 0.0) + transport_cost.get((p, m), 0.0)
+                        rows.append({"Plant": p, "Market": m, "Quantity": round(qty, 2), "UnitCost": round(unit_cost, 2)})
+                        if m in shipped_by_market:
+                            shipped_by_market[m] += float(qty)
+
+                flows_df = pd.DataFrame(rows)
+                total_shipped = float(flows_df['Quantity'].sum()) if not flows_df.empty else 0.0
+                total_demand = float(sum(demand.values()))
+                ratios = []
+                for m in markets:
+                    dem = demand.get(m, 0.0)
+                    ship = shipped_by_market.get(m, 0.0)
+                    ratios.append(ship / dem if dem > 0 else 1.0)
+                min_service = min(ratios) if ratios else 0.0
+
+                st.session_state['results'] = {
+                    'error': None,
+                    'flows': flows_df,
+                    'objective': mdl.objective_value,
+                    'total_shipped': total_shipped,
+                    'total_demand': total_demand,
+                    'min_service': min_service,
+                    'target_service': service_level,
+                }
         else:
+            # 直接成功的情況
             rows = []
             shipped_by_market = {m: 0.0 for m in markets}
             for v in mdl.iter_variables():
                 qty = v.solution_value
                 if qty and qty > 0:
-                    parts = v.name.split("_")
-                    p = parts[1] if len(parts) >= 3 else "?"
-                    m = "_".join(parts[2:]) if len(parts) >= 3 else v.name
-                    unit_cost = prod_cost.get(p, 0) + transport_cost.get((p, m), 0)
+                    # 安全分割：只切兩次，避免名稱含底線導致錯位
+                    parts = v.name.split("_", 2)
+                    p = parts[1] if len(parts) >= 2 else "?"
+                    m = parts[2] if len(parts) >= 3 else v.name
+                    unit_cost = prod_cost.get(p, 0.0) + transport_cost.get((p, m), 0.0)
                     rows.append({"Plant": p, "Market": m, "Quantity": round(qty, 2), "UnitCost": round(unit_cost, 2)})
                     if m in shipped_by_market:
                         shipped_by_market[m] += float(qty)
+
             flows_df = pd.DataFrame(rows)
             total_shipped = float(flows_df['Quantity'].sum()) if not flows_df.empty else 0.0
             total_demand = float(sum(demand.values()))
@@ -349,6 +430,7 @@ if run_solve:
                 ship = shipped_by_market.get(m, 0.0)
                 ratios.append(ship / dem if dem > 0 else 1.0)
             min_service = min(ratios) if ratios else 0.0
+
             st.session_state['results'] = {
                 'error': None,
                 'flows': flows_df,
@@ -358,7 +440,6 @@ if run_solve:
                 'min_service': min_service,
                 'target_service': service_level,
             }
-
 
 
 st.subheader("Results")
